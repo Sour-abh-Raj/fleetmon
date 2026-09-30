@@ -163,6 +163,17 @@ class Processes:
         self._win_cache: tuple[float, dict[int, dict]] = (0.0, {})
         self._proc_cache: tuple[float, dict[int, dict]] = (0.0, {})
         self._prev_ct: dict[int, tuple[float, float]] = {}
+        #: pid -> (cmdline, cwd, create_time). All three are immutable for a
+        #: live process, and on Windows all three cost ~2ms to read.
+        self._fixed: dict[int, tuple[list, str, float]] = {}
+        self._seen_pids: set[int] = set()
+        #: Last known CPU% and RSS, refreshed on the sweep tick rather than
+        #: every tick. See :meth:`_raw_psutil` for why that distinction is the
+        #: difference between 12% of a core and all of one.
+        self._cpu: dict[int, float] = {}
+        self._rss: dict[int, int] = {}
+        self._tick = 0
+        self.sweep_every = 10
 
     # -- public ---------------------------------------------------------------
 
@@ -268,33 +279,79 @@ class Processes:
         now = time.time()
         prev, self._prev_ct = self._prev_ct, {}
         out = []
-        for pr in psutil.process_iter(["pid", "name", "cmdline",
-                                       "memory_info", "create_time",
-                                       "cwd", "status"]):
+        # On Windows every per-process attribute beyond pid and name costs ~2ms,
+        # because each one opens a full process handle. For 330 processes that
+        # is most of a second per frame -- longer than the refresh interval, so
+        # the dashboard never slept and ran a core hot showing nothing new.
+        #
+        # So the frame is split in two. Every tick reads only pid and name,
+        # which cost 13ms in total, plus full CPU times for the handful of
+        # processes whose image name could be an agent. Everything that changes
+        # slowly -- resident memory for all processes, CPU for the rest -- is
+        # refreshed on a sweep instead, ten ticks apart. The sweep is what the
+        # "top processes" table is built from, and ten seconds is far finer
+        # than a human reads that table.
+        sweep = (self._tick % self.sweep_every) == 0
+        self._tick += 1
+        attrs = ["pid", "name", "memory_info"] if sweep else ["pid", "name"]
+        for pr in psutil.process_iter(attrs):
             try:
                 info = pr.info
-                ct = pr.cpu_times()
-                total = float(getattr(ct, "user", 0.0)) + \
-                    float(getattr(ct, "system", 0.0))
-                created = info.get("create_time") or 0.0
                 key = info["pid"]
-                self._prev_ct[key] = (total, now)
-                was = prev.get(key)
-                cpu = 0.0
-                if was and now > was[1]:
-                    cpu = max(0.0, 100.0 * (total - was[0]) / (now - was[1]))
-                cmd = " ".join(info.get("cmdline") or [])
+                nm = info.get("name") or ""
+                if sweep or CANDIDATE_NAMES.search(nm):
+                    ct = pr.cpu_times()
+                    total = float(getattr(ct, "user", 0.0)) + \
+                        float(getattr(ct, "system", 0.0))
+                    self._prev_ct[key] = (total, now)
+                    was = prev.get(key)
+                    cpu = 0.0
+                    if was and now > was[1]:
+                        cpu = max(0.0, 100.0 * (total - was[0]) / (now - was[1]))
+                    self._cpu[key] = cpu
+                else:
+                    cpu = self._cpu.get(key, 0.0)
+                cached = self._fixed.get(key)
+                if cached is None:
+                    try:
+                        cl = pr.cmdline() or []
+                    except Exception:
+                        cl = []
+                    try:
+                        wd = pr.cwd() or ""
+                    except Exception:
+                        wd = ""
+                    try:
+                        created = float(pr.create_time() or 0.0)
+                    except Exception:
+                        created = 0.0
+                    cached = (cl, wd, created)
+                    self._fixed[key] = cached
+                cl, wd, created = cached
+                rss = (getattr(info.get("memory_info"), "rss", 0) or 0) >> 20
+                if sweep or rss:
+                    self._rss[key] = rss
+                else:
+                    rss = self._rss.get(key, 0)
+                cmd = " ".join(cl)
                 out.append((key, {
                     "cmd": cmd,
-                    "name": info.get("name") or "",
+                    "name": nm,
                     "cpu": cpu,
-                    "rss": (getattr(info.get("memory_info"), "rss", 0) or 0) >> 20,
+                    "rss": rss,
                     "create": created,
-                    "cwd": info.get("cwd") or "",
-                    "state": info.get("status") or "",
+                    "cwd": wd,
+                    "state": "R" if cpu > 0 else "S",
                 }))
             except Exception:
                 continue
+        # Forget processes that have exited, or the caches become a slow leak
+        # of every command line the machine has ever run.
+        alive = {k for k, _ in out}
+        for dead in [p for p in self._fixed if p not in alive]:
+            self._fixed.pop(dead, None)
+            self._cpu.pop(dead, None)
+            self._rss.pop(dead, None)
         return out
 
     def _raw_wmi(self) -> list[tuple[int, dict]]:
