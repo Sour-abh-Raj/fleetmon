@@ -1,0 +1,53 @@
+# fleetmon -- example configuration
+#
+# Every key below is optional; the defaults are shown. Drop this at
+# ~/.config/fleetmon/fleetmon.toml (all machines) or ./fleetmon.toml
+# (just this checkout). A local file wins over a global one.
+
+[ui]
+label = ""                  # shown instead of the hostname
+refresh = 1.0               # seconds between frames
+history = 400               # frames kept for scrollback
+alt_screen = true           # false keeps real terminal scrollback too
+mouse = false
+wide_at = 132               # collapse to one column below this width
+min_width = 60
+min_height = 18
+# panels = ["system", "agents", "sessions", "llm", "reading"]
+# hidden_panels = ["sessions"]
+
+[collect]
+probe_ports = true          # HTTP health probes on configured ports
+probe_timeout = 1.2
+read_transcripts = true     # parse ~/.claude/projects/*.jsonl
+max_transcripts = 48
+transcript_budget = 2097152
+gpu = true
+
+# Machines to pull from. Each returns the same snapshot this one produces.
+[[hosts]]
+name = "nixos"              # label in the UI
+via = "ssh"                 # ssh | file | http
+target = "tunix"            # ssh host, path, or http://host:port/
+interval = 2.0              # 0 = same as refresh
+# color = 141
+
+# [[hosts]]
+# name = "shared"
+# via = "file"
+# target = "~/fleetmon-inbox"
+
+[limits]
+warn_cpu = 78.0
+crit_cpu = 92.0
+warn_mem = 85.0
+crit_mem = 94.0
+warn_disk = 88.0
+crit_disk = 95.0
+stale_host = 8.0            # seconds before a silent peer is called stale
+
+[detect]
+# Extra agent signatures: label, then a regex matched against the command line.
+# agent_patterns = [["paper-run", "regen_paper\\.py"], ["scraper", "scrapy"]]
+# Never show these, matched as substrings.
+# ignore_cmd = ["grep", "vim"]
